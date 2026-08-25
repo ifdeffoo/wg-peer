@@ -1,0 +1,54 @@
+// {{ ansible_managed | default('Ansible managed') }}
+//
+// Settings for the "{{ peer_browser_profile.name }}" profile.
+//
+// user.js, not prefs.js: the browser copies these over prefs.js at EVERY
+// startup, so a setting changed in the UI — deliberately or by a stray click in
+// Network Settings — lasts only until the next launch. That is as close to
+// locked as a setting can be while still being per-profile, which is the point.
+// An enterprise policies.json would lock it harder but applies to every profile
+// at once, which defeats having more than one.
+{% if peer_browser_profile.proxy == 'socks' %}
+
+// --- Through the SOCKS proxy -------------------------------------------------
+// Connections are made from wherever {{ peer_socks_listen }} comes
+// out, which is not this host.
+user_pref("network.proxy.type", 1);
+user_pref("network.proxy.socks", "{{ peer_socks_listen.split(':')[0] }}");
+user_pref("network.proxy.socks_port", {{ peer_socks_listen.split(':')[1] }});
+user_pref("network.proxy.socks_version", 5);
+
+// DNS THROUGH THE PROXY, NOT BESIDE IT. A SOCKS proxy carries only what the
+// client hands it. Resolving locally would send every hostname to the LAN
+// resolver and out to the public resolvers from THIS rack, while the packets
+// themselves left elsewhere — a perfect record of the browsing, attributed to
+// the address the proxy exists to avoid using. Mullvad Browser defaults this
+// on; setting it here makes it not a default being relied upon.
+user_pref("network.proxy.socks_remote_dns", true);
+
+// No exceptions list. The stock value exempts localhost and RFC1918, which on a
+// profile whose whole purpose is that its traffic leaves elsewhere is a hole
+// rather than a convenience.
+user_pref("network.proxy.no_proxies_on", "");
+
+// DNS-over-HTTPS off. It would bypass the SOCKS resolver and issue lookups over
+// the browser's own connection, which is not what "remote DNS" above was for.
+user_pref("network.trr.mode", 5);
+{% else %}
+
+// --- No proxy ----------------------------------------------------------------
+// Not direct from this machine either: {{ local_user }}'s egress is
+// policy-routed through the VPN interface or nowhere at all. What it means is
+// the provider's own exit rather than a further hop.
+user_pref("network.proxy.type", 0);
+{% endif %}
+{% if peer_browser_profile.homepage | default('') | length > 0 %}
+
+// --- Home page --------------------------------------------------------------
+// Opened on startup and by the home button. For the persona profile a
+// what-is-my-IP page turns every launch into a check that egress is where it
+// should be. Set here rather than in the UI so it survives, like everything
+// else in this file.
+user_pref("browser.startup.page", 1);
+user_pref("browser.startup.homepage", "{{ peer_browser_profile.homepage }}");
+{% endif %}

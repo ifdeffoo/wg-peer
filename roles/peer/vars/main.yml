@@ -1,0 +1,22 @@
+---
+# Derived, not configuration. In vars/ rather than defaults/ so the unit names
+# can never drift from the interface names they are built out of — wg-quick's
+# template unit takes the interface as its instance, and a host where those two
+# disagree fails in a way that reads as systemd being broken.
+
+peer_unit: "wg-quick@{{ peer_interface }}.service"
+
+# The unit the OTHER play owns. Named here so the ordering drop-in and this
+# role's own unit have one spelling of it between them.
+# "none" means reach the peer over the default route. Everything that depends on
+# an outer tunnel is gated on this.
+peer_via_vpn: "{{ peer_via_interface != 'none' }}"
+
+peer_via_unit: "wg-quick@{{ peer_via_interface }}.service"
+
+# Which ssh_config alias an unattended service uses. The TUNNEL one where a
+# forward-only key exists, because a service has no agent and no terminal and so
+# cannot use a passphrased key; the human alias otherwise. Derived rather than
+# configured, so the socks unit and the check that precedes it can never
+# disagree about which key is being tested.
+peer_socks_ssh_alias: "{{ peer_tunnel_alias if (peer_tunnel_key_enabled | bool) else (peer_alias | default('peer', true)) }}"

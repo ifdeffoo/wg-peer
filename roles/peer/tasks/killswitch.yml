@@ -1,0 +1,40 @@
+---
+# The fail-closed half, loaded before the tunnel so it is never up unprotected.
+
+- name: Deploy the peer egress policy script
+  ansible.builtin.template:
+    src: peer-egress-policy.sh.j2
+    dest: /usr/local/sbin/peer-egress-policy.sh
+    owner: root
+    group: root
+    mode: "0750"
+  notify: Reload the peer kill switch
+
+- name: Deploy the peer kill-switch ruleset
+  ansible.builtin.template:
+    src: killswitch-peer.nft.j2
+    dest: /etc/wireguard/killswitch-peer.nft
+    owner: root
+    group: root
+    mode: "0600"
+    validate: "/usr/sbin/nft -c -f %s"
+  when: peer_killswitch_enabled | bool
+  notify: Reload the peer kill switch
+
+- name: Deploy the peer kill-switch unit
+  ansible.builtin.template:
+    src: killswitch-peer.service.j2
+    dest: /etc/systemd/system/peer-killswitch.service
+    owner: root
+    group: root
+    mode: "0644"
+  when: peer_killswitch_enabled | bool
+  notify: Reload the peer kill switch
+
+- name: Enable the peer kill switch
+  ansible.builtin.systemd:
+    name: peer-killswitch.service
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  when: peer_killswitch_enabled | bool

@@ -1,0 +1,12 @@
+# {{ ansible_managed | default('Ansible managed') }}
+#
+# A drop-in on the OUTER tunnel's unit, owned by roles/peer. See tunnel.yml for
+# why the route lives here rather than in the inner tunnel's PostUp: it is bound
+# to this device, so it must be reinstalled every time this device appears, and
+# nothing else has that lifecycle.
+#
+# In the MAIN table, deliberately — the outer packets of the inner tunnel are
+# emitted by the kernel with no user socket behind them, so they are not subject
+# to the per-account policy rules and would never look in the VPN table.
+[Service]
+ExecStartPost=/usr/sbin/ip route replace {{ peer_endpoint_ip }}/32 dev {{ peer_via_interface }}

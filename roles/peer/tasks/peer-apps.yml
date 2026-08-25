@@ -1,0 +1,32 @@
+---
+# The tunnel account's shell, and any apps to run on the peer via xpra. All
+# delegated to the peer.
+
+- name: Install bash-completion on the peer
+  ansible.builtin.apt:
+    name: bash-completion
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+  delegate_to: peer_remote
+
+# force: no — a backfill for an account whose skel predated bash-completion,
+# never an overwrite of a customised bashrc.
+- name: Ensure the peer account has a bashrc
+  ansible.builtin.copy:
+    src: /etc/skel/.bashrc
+    dest: "/home/{{ peer_user }}/.bashrc"
+    remote_src: yes
+    force: no
+    owner: "{{ peer_user }}"
+    group: "{{ peer_user }}"
+    mode: "0644"
+  delegate_to: peer_remote
+
+# --- Apps to run on the peer ------------------------------------------------------
+- name: Install the peer-side apps
+  ansible.builtin.apt:
+    name: "{{ peer_remote_apps }}"
+    state: present
+  delegate_to: peer_remote
+  when: peer_remote_apps | length > 0

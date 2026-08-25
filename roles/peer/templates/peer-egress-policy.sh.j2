@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# {{ ansible_managed | default('Ansible managed') }}
+#
+# One exception to the other play's per-account VPN egress policy: the accounts
+# it confines to the VPN routing table must still reach the peer's tunnel subnet
+# through the MAIN table, or the packets would be handed to the commercial VPN's
+# default route and go nowhere.
+#
+# WHY THIS PRIORITY
+# -----------------
+# The other play's policy script owns priorities 100 (its direct exceptions) and
+# 110 (its catch-all into the VPN table), and its teardown loop deletes those two
+# and nothing else — that is a stated contract there, not an accident. So a rule
+# below 100 is evaluated first and is never torn down by its next run, which is
+# what lets these two scripts be owned by two repositories and run in either
+# order.
+#
+# Unconfined accounts need no rule at all: they already use the main table.
+set -uo pipefail
+
+PRIO={{ peer_rule_priority }}
+
+# Teardown by priority, looped, so re-running this never stacks duplicate rules.
+# `ip rule add` is not idempotent and has no `replace`.
+while ip rule del priority "$PRIO" 2>/dev/null; do :; done
+
+{% if peer_direct_uids | default([]) | length > 0 %}
+{% for u in peer_direct_uids %}
+# {{ u.name }} (uid {{ u.uid }}) — the peer subnet, direct, via the main table.
+ip rule add priority "$PRIO" uidrange {{ u.uid }}-{{ u.uid }} to {{ peer_subnet }} lookup main
+{% endfor %}
+{% else %}
+# peer_direct_users is empty. Nothing to except — which is correct only if no
+# account on this host is confined to a VPN routing table.
+{% endif %}
+
+exit 0

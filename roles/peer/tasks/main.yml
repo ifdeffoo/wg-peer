@@ -1,0 +1,43 @@
+---
+# Order matters. The fail-closed rules and the route to the peer load before
+# anything can send it a packet; the peer is configured before the local tunnel
+# config is written, because that config needs the peer's public key; and every
+# check runs last, against a host that has finished converging.
+
+- name: Check what this play is being asked to build on
+  ansible.builtin.import_tasks: preflight.yml
+
+- name: Load the fail-closed rules before anything can leak
+  ansible.builtin.import_tasks: killswitch.yml
+
+- name: Route the peer through the outer tunnel
+  ansible.builtin.import_tasks: route.yml
+  when: peer_via_vpn | bool
+
+- name: Configure SSH to the peer
+  ansible.builtin.import_tasks: ssh.yml
+  when: peer_ssh_enabled | bool
+
+- name: Configure the peer
+  ansible.builtin.import_tasks: remote.yml
+
+- name: The peer's shell and apps
+  ansible.builtin.import_tasks: peer-apps.yml
+
+- name: Bring up the local end of the tunnel
+  ansible.builtin.import_tasks: tunnel.yml
+
+- name: Install xpra
+  ansible.builtin.import_tasks: xpra.yml
+  when: peer_xpra | bool
+
+- name: Run the SOCKS proxy through the peer
+  ansible.builtin.import_tasks: socks.yml
+  when: peer_socks_enabled | bool
+
+- name: Add the browser profile that goes through the peer
+  ansible.builtin.import_tasks: browser.yml
+  when: peer_browser_enabled | bool
+
+- name: Prove the chain actually works
+  ansible.builtin.import_tasks: verify.yml

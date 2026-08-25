@@ -1,0 +1,73 @@
+#!/usr/sbin/nft -f
+# {{ ansible_managed | default('Ansible managed') }}
+#
+# Fail-closed rules for the peer tunnel. Read roles/peer/defaults/main.yml first.
+#
+# WHY A SECOND TABLE RATHER THAN RULES IN THE FIRST ONE
+# ----------------------------------------------------
+# The other play loads a table of its own and knows nothing about the peer.
+# These rules belong to a different repository and a different decision, and
+# they have to be able to be added and removed on their own.
+#
+# That works because of how nftables evaluates hooks: EVERY base chain
+# registered at a hook runs, and `accept` terminates only the chain it appears
+# in — not the hook. A `drop` anywhere at the hook is final. So the other table
+# can never accept away a drop written here, and this table can never accept
+# away a drop written there. Two authors, two files, no shared state, and the
+# strictest verdict wins.
+#
+# `oifname` AND NOT `oif`
+# ----------------------
+# `oif` resolves an interface name to its index when the ruleset is LOADED, and
+# fails if the interface does not exist. This file is loaded at boot, before
+# wg-quick has created anything, so `oif` would abort the load and leave the
+# host with no kill switch at exactly the moment it has no tunnel either.
+# `oifname` compares strings per packet and is correct whether the interface
+# exists or not — including the case that matters, where it does not exist and
+# therefore cannot match.
+#
+# EVERY RULE CARRIES A COUNTER. This ruleset's whole job is to discard packets
+# silently, which makes it the least observable thing on the host. With counters,
+#
+#   nft list table inet {{ peer_killswitch_table }}
+#
+# says which rule matched how many packets, so the switch can be exonerated at a
+# glance rather than by inference.
+#
+# Declaring the table creates it when absent, so the delete below always has a
+# target. Without the declaration, the first load on a fresh boot fails with
+# "No such file or directory" and no rules are installed at all.
+table inet {{ peer_killswitch_table }}
+delete table inet {{ peer_killswitch_table }}
+
+table inet {{ peer_killswitch_table }} {
+    chain output {
+        # Slightly ahead of the other table's chain, so counters read in the
+        # order you would reason about them. Correctness does not depend on it:
+        # a drop at this hook is final wherever it appears.
+        type filter hook output priority {{ peer_killswitch_priority }}; policy accept;
+
+{% if peer_via_vpn | bool %}
+        # THE RULE THAT MATTERS MOST IN THIS FILE. WireGuard packets this host
+        # sends to the peer's public address, leaving by anything other than the
+        # outer tunnel.
+        #
+        # When {{ peer_via_interface }} goes away its /32 route to the peer goes with it and
+        # the kernel falls back to the default route — at which point the tunnel
+        # carries on working perfectly, over a path it was never meant to use,
+        # with nothing logged and nothing to notice. This rule turns that into a
+        # visible failure.
+        ip daddr {{ peer_endpoint_ip }} oifname != "{{ peer_via_interface }}" counter drop
+{% else %}
+        # No outer tunnel: the peer's own packets take the default route by
+        # design, so there is no interface to require and nothing to fail closed
+        # to. The rule below still holds — the tunnel SUBNET must not escape.
+{% endif %}
+
+        # The inner tunnel's addressing. If {{ peer_interface }} is down, traffic to the peer's
+        # private address falls back to the default route as well — and RFC1918
+        # destinations handed to an upstream do not simply vanish, they get
+        # logged, and on some paths they get routed. Same rule, one layer up.
+        ip daddr {{ peer_subnet }} oifname != "{{ peer_interface }}" counter drop
+    }
+}

@@ -1,0 +1,54 @@
+---
+# The local end of the tunnel. Runs after remote.yml, which supplies the peer's
+# public key. diff: false — the config holds a private key.
+
+- name: Deploy the peer tunnel config
+  ansible.builtin.template:
+    src: wg-peer.conf.j2
+    dest: "/etc/wireguard/{{ peer_interface }}.conf"
+    owner: root
+    group: root
+    mode: "0600"
+  diff: false
+  notify: Restart the peer tunnel
+
+- name: Create the peer tunnel's systemd drop-in directory
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ peer_unit }}.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: peer_via_vpn | bool
+
+- name: Order the peer tunnel after the outer one
+  ansible.builtin.template:
+    src: peer-after-vpn.conf.j2
+    dest: "/etc/systemd/system/{{ peer_unit }}.d/after-vpn.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart the peer tunnel
+  when: peer_via_vpn | bool
+
+- name: Enable and start the peer tunnel
+  ansible.builtin.systemd:
+    name: "{{ peer_unit }}"
+    state: started
+    enabled: yes
+    daemon_reload: yes
+
+# /etc/hosts so `ssh <alias>` issues no DNS query — see peer_alias in defaults.
+- name: Give the peer a local name
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} ANSIBLE MANAGED: peer tunnel (roles/peer)"
+    state: "{{ 'present' if peer_alias | length > 0 else 'absent' }}"
+    block: |
+      {{ peer_remote_address }} {{ peer_alias | default('peer', true) }}
+
+# Both ends are configured now, so restart tunnels before anything uses the link.
+# state: started does not reload an already-running unit (the rebuilt-peer case),
+# so the restart is a handler that would otherwise not fire until play's end.
+- name: Bring both tunnels onto their current config before using the link
+  ansible.builtin.meta: flush_handlers

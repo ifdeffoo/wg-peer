@@ -1,0 +1,6 @@
+---
+- hosts: all
+  become: true
+  force_handlers: true
+  roles:
+    - peer

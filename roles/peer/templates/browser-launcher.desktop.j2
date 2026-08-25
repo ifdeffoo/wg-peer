@@ -1,0 +1,18 @@
+[Desktop Entry]
+# {{ ansible_managed | default('Ansible managed') }}
+#
+# One launcher per profile, labelled for the profile rather than the browser:
+# where there is more than one entry they differ only in which network path they
+# use, so a menu with the same browser name twice would be worse than useless.
+Type=Application
+Version=1.0
+Name={{ peer_browser_profile.label | default(peer_browser_profile.name) }}
+Comment={{ peer_browser_profile.comment | default('Browser profile: ' ~ peer_browser_profile.name) }}
+Icon={{ peer_browser_icon }}
+# -P selects the profile by name. No %u: a launcher that accepts a URL can be
+# handed one by another application, and which profile opens a link should not
+# be decided by whatever happened to register as the default handler.
+Exec={{ peer_browser_command }} -P {{ peer_browser_profile.name }}
+Terminal=false
+StartupNotify=true
+Categories=Network;WebBrowser;

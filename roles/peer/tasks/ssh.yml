@@ -1,0 +1,92 @@
+---
+# SSH to the peer: a dedicated key and a pinned client config. See
+# defaults/main.yml for why the key only works alongside IdentitiesOnly.
+
+- name: Ensure the SSH directory exists
+  ansible.builtin.file:
+    path: "/home/{{ local_user }}/.ssh"
+    state: directory
+    owner: "{{ local_user }}"
+    group: "{{ local_group }}"
+    mode: "0700"
+
+# -C '' so no account@hostname comment travels into the peer's authorized_keys.
+# creates: makes it idempotent and non-destructive — regenerating would lock out
+# a peer that already trusts the old key.
+- name: Generate a dedicated key pair for the peer
+  ansible.builtin.command:
+    cmd: >-
+      ssh-keygen -t {{ peer_ssh_key_type }} -N '' -C ''
+      -f /home/{{ local_user }}/{{ peer_ssh_key }}
+    creates: "/home/{{ local_user }}/{{ peer_ssh_key }}"
+  become: true
+  become_user: "{{ local_user }}"
+  when: peer_ssh_generate_key | bool
+
+- name: Secure the peer key
+  ansible.builtin.file:
+    path: "/home/{{ local_user }}/{{ peer_ssh_key }}"
+    owner: "{{ local_user }}"
+    group: "{{ local_group }}"
+    mode: "0600"
+
+# When the role does not mint the key, its absence is the rebuild case and must
+# be loud — restore it from the password database and re-run.
+- name: Confirm the peer key is present
+  ansible.builtin.stat:
+    path: "/home/{{ local_user }}/{{ peer_ssh_key }}"
+  register: peer_key_stat
+  when: not (peer_ssh_generate_key | bool)
+
+- name: Assert the peer key survived
+  ansible.builtin.assert:
+    that: peer_key_stat.stat.exists
+    fail_msg: >-
+      No key at /home/{{ local_user }}/{{ peer_ssh_key }}, and this host is set
+      not to generate one. Restore it from the password database and re-run.
+    success_msg: "Peer key present."
+  when: not (peer_ssh_generate_key | bool)
+
+# Forward-only key for the SOCKS service. Same -N '' -C '' and creates: guard.
+- name: Generate the forward-only key pair for unattended use
+  ansible.builtin.command:
+    cmd: >-
+      ssh-keygen -t {{ peer_ssh_key_type }} -N '' -C ''
+      -f /home/{{ local_user }}/{{ peer_tunnel_key }}
+    creates: "/home/{{ local_user }}/{{ peer_tunnel_key }}"
+  become: true
+  become_user: "{{ local_user }}"
+  when: peer_tunnel_key_enabled | bool
+
+- name: Secure the forward-only key
+  ansible.builtin.file:
+    path: "/home/{{ local_user }}/{{ peer_tunnel_key }}"
+    owner: "{{ local_user }}"
+    group: "{{ local_group }}"
+    mode: "0600"
+  when: peer_tunnel_key_enabled | bool
+
+- name: Pin the SSH client configuration for the peer
+  ansible.builtin.blockinfile:
+    path: "/home/{{ local_user }}/.ssh/config"
+    marker: "# {mark} ANSIBLE MANAGED: peer (roles/peer)"
+    create: yes
+    owner: "{{ local_user }}"
+    group: "{{ local_group }}"
+    mode: "0600"
+    block: "{{ lookup('template', 'ssh-config-peer.j2') }}"
+
+# Read from the files (not the keygen output) so re-runs that generated nothing
+# still get the values. remote.yml authorizes these on the peer.
+- name: Read the peer key's public half
+  ansible.builtin.slurp:
+    src: "/home/{{ local_user }}/{{ peer_ssh_key }}.pub"
+  register: peer_ssh_pub
+  failed_when: false
+
+- name: Read the forward-only key's public half
+  ansible.builtin.slurp:
+    src: "/home/{{ local_user }}/{{ peer_tunnel_key }}.pub"
+  register: peer_tunnel_pub
+  failed_when: false
+  when: peer_tunnel_key_enabled | bool

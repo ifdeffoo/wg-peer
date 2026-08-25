@@ -1,0 +1,174 @@
+# local.yml is gitignored, so an absent file just leaves these empty.
+- name: Assert the deployment values are supplied
+  ansible.builtin.assert:
+    that:
+      - peer_private_key | length > 0
+      - peer_endpoint_ip | length > 0
+    fail_msg: >-
+      group_vars/all/local.yml is missing or incomplete — copy local.yml.example
+      beside it and fill in peer_private_key and peer_endpoint_ip.
+    quiet: true
+
+- name: Assert the peer endpoint is a literal IPv4 address
+  ansible.builtin.assert:
+    that:
+      - peer_endpoint_ip is match('^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+    fail_msg: >-
+      peer_endpoint_ip must be a literal IPv4 address, not a hostname
+      ({{ peer_endpoint_ip }}).
+    quiet: true
+
+- name: Derive the public key from the tunnel private key
+  ansible.builtin.command:
+    cmd: wg pubkey
+    stdin: "{{ peer_private_key }}"
+  register: peer_derived_pubkey
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+# Which interface carries this host's traffic, or whether one does. Detected from
+# /etc/wireguard/*.conf, NOT `wg show` — a DOWN tunnel must not read as "no VPN,
+# go direct". Override with peer_via_interface, or "none" for the default route.
+- name: List the WireGuard configs on this host
+  ansible.builtin.find:
+    paths: /etc/wireguard
+    patterns: "*.conf"
+  register: peer_wg_configs
+  when: peer_via_interface | length == 0
+
+- name: Note the candidates
+  ansible.builtin.set_fact:
+    peer_via_candidates: >-
+      {{ peer_wg_configs.files | default([]) | map(attribute='path') | map('basename')
+         | map('regex_replace', '\.conf$', '') | difference([peer_interface]) | sort }}
+  when: peer_via_interface | length == 0
+
+- name: Choose the outer tunnel
+  ansible.builtin.set_fact:
+    peer_via_interface: "{{ peer_via_candidates[0] if peer_via_candidates | length == 1 else 'none' }}"
+  when:
+    - peer_via_interface | length == 0
+    - peer_via_candidates | length <= 1
+
+- name: Assert the choice is unambiguous
+  ansible.builtin.assert:
+    that: peer_via_interface | length > 0
+    fail_msg: >-
+      /etc/wireguard holds more than one config besides {{ peer_interface }}.conf
+      ({{ peer_via_candidates | default([]) | join(', ') }}) — set
+      peer_via_interface to the one to use, or "none" for the default route.
+    success_msg: >-
+      {{ 'Carrying this tunnel inside ' ~ peer_via_interface
+         if peer_via_vpn | bool else 'No VPN tunnel — connecting to the peer directly.' }}
+
+- name: Note what direct means
+  ansible.builtin.debug:
+    msg: >-
+      peer_via_interface is "none": the peer sees this host's own address and its
+      traffic takes the default route. The ruleset still confines the tunnel
+      subnet, but cannot require the tunnel's packets to leave by any interface.
+  when: not (peer_via_vpn | bool)
+
+- name: Look for the outer tunnel
+  ansible.builtin.command: "ip link show dev {{ peer_via_interface }}"
+  register: peer_via_link
+  changed_when: false
+  failed_when: false
+  when: peer_via_vpn | bool
+
+- name: Assert the outer tunnel is up
+  ansible.builtin.assert:
+    that: peer_via_link.rc == 0
+    fail_msg: >-
+      No {{ peer_via_interface }} interface, though {{ peer_via_interface }}.conf
+      exists — so it is down, not absent. Bring it up, or set peer_via_interface
+      to "none" for the default route.
+    success_msg: "{{ peer_via_interface }} is up."
+  when: peer_via_vpn | bool
+
+# Which local account this configures.
+- name: Find who owns this checkout
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}"
+  register: peer_checkout
+  when: local_user | length == 0
+
+- name: Take the local account from the checkout's owner
+  ansible.builtin.set_fact:
+    local_user: "{{ peer_checkout.stat.pw_name }}"
+  when: local_user | length == 0
+
+- name: Assert the local account is not a privileged one
+  ansible.builtin.assert:
+    that:
+      - local_user | length > 0
+      - local_user != 'root'
+      - local_user != (ansible_env.SUDO_USER | default('', true))
+      - local_user != peer_ssh_user
+      - local_user != peer_user
+    fail_msg: >-
+      local_user resolved to "{{ local_user }}", which cannot be right: not root,
+      not the invoking account ({{ ansible_env.SUDO_USER | default('?', true) }}),
+      and not a peer account ({{ peer_ssh_user }}/{{ peer_user }}). Set local_user
+      in local.yml, or chown the checkout to the right account.
+    success_msg: "Configuring {{ local_user }}."
+
+- name: Resolve the local account's uid
+  ansible.builtin.command: "id -u {{ local_user }}"
+  register: peer_local_uid
+  changed_when: false
+  failed_when: false
+
+- name: Assert the local account exists
+  ansible.builtin.assert:
+    that: peer_local_uid.rc == 0
+    fail_msg: >-
+      "{{ local_user }}" is not an account on this host — whatever configures the
+      machine creates it; run that first.
+    quiet: true
+
+- name: Look for the local account's egress policy
+  ansible.builtin.shell: >-
+    ip rule list | grep 'uidrange {{ peer_local_uid.stdout }}-{{ peer_local_uid.stdout }}'
+    | grep -vc 'lookup main'
+  register: peer_local_policy
+  changed_when: false
+  failed_when: false
+  when: peer_via_vpn | bool
+
+- name: Assert the local account's egress is policy-routed
+  ansible.builtin.assert:
+    that: peer_local_policy.stdout | default('0') | int > 0
+    fail_msg: >-
+      {{ local_user }} (uid {{ peer_local_uid.stdout }}) has no ip rule off the
+      main table, so its non-proxied traffic takes the default route. Wrong
+      account, or the host's egress policy is not configured.
+    success_msg: "{{ local_user }} is policy-routed away from the main table."
+  when: peer_via_vpn | bool
+
+# Named accounts that do not exist would silently drop out of the rules.
+- name: Resolve the uids of accounts that reach the peer directly
+  ansible.builtin.command: "id -u {{ item }}"
+  register: peer_direct_ids
+  changed_when: false
+  failed_when: false
+  loop: "{{ peer_direct_users }}"
+
+- name: Assert every account that reaches the peer exists
+  ansible.builtin.assert:
+    that: item.rc == 0
+    fail_msg: >-
+      peer_direct_users names "{{ item.item }}", not an account on this host.
+    quiet: true
+  loop: "{{ peer_direct_ids.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Build the uid list for the peer-subnet exception
+  ansible.builtin.set_fact:
+    peer_direct_uids: >-
+      {{ peer_direct_uids | default([]) + [{'name': item.item, 'uid': item.stdout}] }}
+  loop: "{{ peer_direct_ids.results }}"
+  loop_control:
+    label: "{{ item.item }}"

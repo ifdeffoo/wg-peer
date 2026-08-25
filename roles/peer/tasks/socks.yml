@@ -1,0 +1,47 @@
+---
+# An SSH SOCKS proxy over the tunnel. The browser runs HERE; its traffic leaves
+# from the peer. See peer_socks_enabled in defaults/main.yml.
+
+- name: Deploy the SOCKS proxy unit
+  ansible.builtin.template:
+    src: socks-peer.service.j2
+    dest: /etc/systemd/system/socks-peer.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart the socks proxy
+
+# Checked here, not left to the service, because the unit authenticates the same
+# way — non-interactively, no agent, on-disk key. If that key is wrong the unit
+# just restart-loops and the only symptom upstream is an empty proxy response.
+- name: Check the browsing account can reach the peer without a terminal
+  ansible.builtin.command: >-
+    ssh -o BatchMode=yes -o ConnectTimeout=10 {{ peer_socks_ssh_alias }} true
+  become: true
+  become_user: "{{ peer_socks_user }}"
+  environment:
+    SSH_AUTH_SOCK: ""
+  register: peer_socks_ssh_check
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Assert the peer accepts the browsing account's key
+  ansible.builtin.assert:
+    that: peer_socks_ssh_check.rc == 0
+    fail_msg: >-
+      `ssh {{ peer_socks_ssh_alias }}` fails for {{ peer_socks_user }} with no
+      agent: {{ peer_socks_ssh_check.stderr | default('') | truncate(200) }}
+      Check {{ peer_tunnel_key if (peer_tunnel_key_enabled | bool) else peer_ssh_key }}
+      exists in its home (0600, owned by it) and its public half is in
+      {{ peer_user }}'s authorized_keys on the peer.
+    success_msg: >-
+      {{ peer_socks_user }} authenticates to the peer non-interactively.
+  when: not ansible_check_mode
+
+- name: Enable the SOCKS proxy
+  ansible.builtin.systemd:
+    name: socks-peer.service
+    state: started
+    enabled: yes
+    daemon_reload: yes

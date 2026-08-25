@@ -1,0 +1,49 @@
+---
+# Where this is deployed. Copy to local.yml beside this file; local.yml is
+# gitignored and never committed.
+#
+# The repository describes the tunnel. These describe the machine it is installed
+# on, and they are the only things that change between deployments.
+# Keep them wherever the SSH key that reaches the peer is kept — they are
+# restored together.
+
+# This host's private key for the tunnel — the KEY ITSELF, not a path to it. It
+# is written straight into the interface config, so paste the base64 that
+# `wg genkey` prints (44 chars, ending in "="), e.g.
+#
+#   wg genkey
+#   qFJ8...41 more base64 chars...=
+#
+# The peer's own key is generated on the peer and never leaves it; only its
+# public half is read back.
+peer_private_key: CHANGEME-output-of-wg-genkey
+
+# The peer's public IPv4. A literal, not a hostname — wg-quick re-resolves a name
+# at every interface bring-up, and the nftables rules match on the address.
+peer_endpoint_ip: CHANGEME
+
+# The WireGuard interface carrying this host's traffic to the internet. Normally
+# left unset: the play reads /etc/wireguard and picks the config that is not the
+# tunnel it manages. Set it where there is more than one, or to "none" to reach
+# the peer over the default route with no outer tunnel at all.
+# peer_via_interface: wg0
+
+# The local account whose egress is policy-routed through the VPN. Normally left
+# unset: it is taken from the owner of this checkout and then checked against the
+# routing policy. Set it only where those two disagree.
+# local_user: someuser
+
+# The account on the PEER that the play connects in as, with the SSH key above
+# authorized on it. Defaults to root (no sudo needed). Set a named account here
+# to connect as that instead — it must have passwordless sudo, which the play
+# escalates through to create peer_user and configure the tunnel.
+# peer_ssh_user: admin
+
+# The unprivileged account on the PEER that the play creates. The forward-only
+# tunnel key is authorized on it and the SOCKS proxy logs in as it. Defaults to
+# "dev"; only set it to match an existing account or a naming preference.
+# peer_user: dev
+
+# apt packages to install ON THE PEER, to run there via xpra. e.g.
+# peer_remote_apps:
+#   - xterm

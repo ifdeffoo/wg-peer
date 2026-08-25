@@ -1,0 +1,22 @@
+# {{ ansible_managed | default('Ansible managed') }}
+#
+# NO PrivateKey LINE. The key is generated on this machine and stays in
+# {{ peer_remote_key_path }}; PostUp loads it into the interface after wg-quick
+# has set everything else. So it is never rendered into a config file, never
+# passes through the machine that runs the play, and exists in one place.
+#
+# No Endpoint either: the other end's source address is a VPN exit that changes,
+# so it initiates and carries the keepalive.
+#
+# AllowedIPs is a single /32. Widening it routes more of this machine's traffic
+# into the tunnel, which is a separate decision.
+
+[Interface]
+Address = {{ peer_remote_address }}/{{ peer_subnet.split('/')[1] }}
+ListenPort = {{ peer_endpoint_port }}
+MTU = {{ peer_mtu }}
+PostUp = wg set %i private-key {{ peer_remote_key_path }}
+
+[Peer]
+PublicKey = {{ peer_derived_pubkey.stdout | trim }}
+AllowedIPs = {{ peer_local_address.split('/')[0] }}/32

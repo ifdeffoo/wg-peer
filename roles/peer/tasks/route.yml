@@ -1,0 +1,38 @@
+---
+# The /32 route that carries the inner tunnel inside the outer one. Runs before
+# remote.yml — it is what makes the peer reachable through the VPN.
+#
+# A drop-in on the OUTER tunnel's unit, not a PostUp here: the route is bound to
+# that device and dies with it, so it must be reinstalled whenever the outer
+# tunnel restarts. In this tunnel's PostUp an outer restart would silently lose
+# it (the kill switch then drops the peer's traffic — symptom: a peer that stops
+# answering).
+- name: Create the outer tunnel's systemd drop-in directory
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ peer_via_unit }}.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Route the peer's endpoint through the outer tunnel
+  ansible.builtin.template:
+    src: peer-route.conf.j2
+    dest: "/etc/systemd/system/{{ peer_via_unit }}.d/peer-route.conf"
+    owner: root
+    group: root
+    mode: "0600"          # names the peer's public address
+  register: peer_route_dropin
+
+- name: Reload systemd so the drop-in takes effect
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: peer_route_dropin is changed
+
+# The drop-in only applies at the outer tunnel's next start, and restarting it
+# would drop every confined account's connections. ip route replace is
+# idempotent, so apply it live too — the drop-in makes it survive a restart.
+- name: Install the route on the running host
+  ansible.builtin.command: >-
+    ip route replace {{ peer_endpoint_ip }}/32 dev {{ peer_via_interface }}
+  changed_when: false

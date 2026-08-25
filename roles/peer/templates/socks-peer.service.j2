@@ -1,0 +1,53 @@
+# {{ ansible_managed | default('Ansible managed') }}
+[Unit]
+Description=SOCKS proxy through the peer, for the browsing account
+Documentation=file:///etc/systemd/system/socks-peer.service
+# The tunnel it rides. Wants= rather than Requires= on purpose: a {{ peer_interface }}
+# restart should not tear this down permanently, and Restart=always below
+# reconnects on its own once the tunnel is back.
+After=network-online.target {{ peer_unit }}
+Wants=network-online.target {{ peer_unit }}
+
+# The tunnel below this may take a while to come up after a boot, and each
+# failed attempt is cheap. Never give up: a proxy that stopped retrying looks
+# exactly like one that is working until the browser cannot load a page.
+#
+# In [Unit], NOT [Service] — systemd.unit(5). It was in [Service] here, where
+# systemd logs "Unknown key name ... ignoring" and carries on with the default
+# limit of five starts per ten seconds. Latent rather than harmful, because
+# RestartSec=10 keeps restarts an interval apart and so under that limit; but
+# the same misplacement elsewhere once left a service dead for twelve hours
+# after a reboot, and it is not worth relying on the spacing.
+StartLimitIntervalSec=0
+
+[Service]
+# Runs as the browsing account, so it uses THAT account's ~/.ssh/config — the
+# peer alias, the dedicated key, IdentitiesOnly and ForwardAgent no all come
+# from there rather than being restated as flags.
+User={{ peer_socks_user }}
+
+# -D binds LOOPBACK ONLY, stated explicitly rather than relying on the default.
+#   Bound anywhere else this is an open SOCKS proxy whose exit is a host you are
+#   specifically trying not to have associated with you — the worst possible
+#   thing to leave listening.
+# -N: no remote command, this is a tunnel and nothing else.
+# ExitOnForwardFailure: if the listener cannot be established, DIE rather than
+#   sit there holding a connection that forwards nothing — otherwise the browser
+#   fails with connection-refused and the service looks healthy.
+# ServerAlive*: notice a tunnel that has gone away without closing, which over a
+#   VPN inside a VPN is the normal way it fails. Without these the service can
+#   hold a dead socket indefinitely and never trigger a restart.
+# BatchMode: never prompt. There is nobody at this terminal.
+ExecStart=/usr/bin/ssh -N \
+    -D {{ peer_socks_listen }} \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o BatchMode=yes \
+    {{ peer_socks_ssh_alias }}
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

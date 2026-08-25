@@ -1,0 +1,114 @@
+---
+# xpra from upstream, on BOTH ends. See peer_xpra in defaults for why the distro
+# build is unusable. xpra runs its X server on the peer, so it needs xpra too, at
+# a matching major — the assert at the end proves it.
+
+# --- This host --------------------------------------------------------------------
+- name: Install the xpra signing key
+  ansible.builtin.get_url:
+    url: "{{ peer_xpra_keyring_url }}"
+    dest: /usr/share/keyrings/xpra.asc
+    owner: root
+    group: root
+    mode: "0644"
+
+# Upstream's own deb822 file, so a repo-layout change doesn't strand the host.
+- name: Add the xpra package repository
+  ansible.builtin.get_url:
+    url: "{{ peer_xpra_sources_url }}"
+    dest: /etc/apt/sources.list.d/xpra.sources
+    owner: root
+    group: root
+    mode: "0644"
+  register: peer_xpra_repo
+
+- name: Install xpra and xauth
+  ansible.builtin.apt:
+    name: [xpra, xpra-x11, xauth]
+    state: present
+    # Recommends drag in CUPS — a channel this design does not want.
+    install_recommends: "{{ peer_xpra_install_recommends | bool }}"
+    update_cache: "{{ peer_xpra_repo is changed }}"
+
+- name: Configure xpra
+  ansible.builtin.copy:
+    dest: /etc/xpra/conf.d/99-local.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # {{ ansible_managed | default('Ansible managed') }}
+      printing = {{ 'yes' if peer_xpra_printing | bool else 'no' }}
+
+- name: Read this host's xpra version
+  ansible.builtin.command: xpra --version
+  register: peer_xpra_version
+  changed_when: false
+  when: not ansible_check_mode
+
+# --- The peer ---------------------------------------------------------------------
+# The upstream repo is per-release, so read the peer's own codename.
+- name: Get the peer's release codename
+  ansible.builtin.command: lsb_release -cs
+  register: peer_release
+  changed_when: false
+  delegate_to: peer_remote
+
+- name: Install the xpra signing key on the peer
+  ansible.builtin.get_url:
+    url: "{{ peer_xpra_keyring_url }}"
+    dest: /usr/share/keyrings/xpra.asc
+    owner: root
+    group: root
+    mode: "0644"
+  delegate_to: peer_remote
+
+- name: Add the xpra package repository on the peer
+  ansible.builtin.get_url:
+    url: "https://raw.githubusercontent.com/Xpra-org/xpra/master/packaging/repos/{{ peer_release.stdout | trim }}/xpra.sources"
+    dest: /etc/apt/sources.list.d/xpra.sources
+    owner: root
+    group: root
+    mode: "0644"
+  register: peer_xpra_repo_remote
+  delegate_to: peer_remote
+
+- name: Install xpra and xauth on the peer
+  ansible.builtin.apt:
+    name: [xpra, xpra-x11, xauth]
+    state: present
+    install_recommends: "{{ peer_xpra_install_recommends | bool }}"
+    update_cache: "{{ peer_xpra_repo_remote is changed }}"
+  delegate_to: peer_remote
+
+- name: Configure xpra on the peer
+  ansible.builtin.copy:
+    dest: /etc/xpra/conf.d/99-local.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # {{ ansible_managed | default('Ansible managed') }}
+      printing = {{ 'yes' if peer_xpra_printing | bool else 'no' }}
+  delegate_to: peer_remote
+
+- name: Read the peer's xpra version
+  ansible.builtin.command: xpra --version
+  register: peer_xpra_version_remote
+  changed_when: false
+  delegate_to: peer_remote
+  when: not ansible_check_mode
+
+# Same major or the ends cannot speak. A mismatch presents as "connects, then
+# exits 1", not a version error, so it is worth asserting.
+- name: Assert the two ends run the same xpra major version
+  ansible.builtin.assert:
+    that:
+      - (peer_xpra_version.stdout | trim).split('.')[0] == (peer_xpra_version_remote.stdout | trim).split('.')[0]
+    fail_msg: >-
+      xpra is {{ peer_xpra_version.stdout | trim }} here and
+      {{ peer_xpra_version_remote.stdout | trim }} on the peer — a stale apt cache
+      or a leftover distro xpra on one side. Reconcile them.
+    success_msg: >-
+      xpra {{ peer_xpra_version.stdout | trim }} on both ends.
+  when: not ansible_check_mode

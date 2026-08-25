@@ -1,0 +1,14 @@
+# Editor swap/backup files. Not just noise: a swap file holds the buffer
+# contents, so one written next to local.yml is a copy of the deployment's
+# private key sitting in the working tree, one `git add -A` away from being
+# committed.
+*.swp
+*.swo
+*~
+.*.sw[a-p]
+
+# Ansible leftovers
+*.retry
+
+# Deployment values, not repository content.
+group_vars/all/local.yml

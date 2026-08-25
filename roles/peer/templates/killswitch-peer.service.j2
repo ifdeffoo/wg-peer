@@ -1,0 +1,37 @@
+# {{ ansible_managed | default('Ansible managed') }}
+[Unit]
+Description=Fail-closed nftables rules and routing exception for the peer tunnel
+Documentation=file:///etc/wireguard/killswitch-peer.nft
+# Load before the tunnel comes up. Both halves are written to be valid with no
+# wg interfaces present — nftables matches on oifname (a string), and the policy
+# script installs only ip rules, never a route through an interface. That is
+# what makes "before" safe as well as correct.
+Before={{ peer_unit }}
+
+# After the other play's kill switch, which is not a dependency so much as an
+# ordering preference: the two are independent by construction (separate table,
+# separate ip rule priority) and neither needs the other to have run. Ordering
+# them anyway keeps the boot log readable and the counters in a sensible order.
+After=nftables.service wireguard-killswitch.service
+
+# nftables.service loads /etc/nftables.conf, which begins with `flush ruleset`.
+# If it ran after us it would silently erase this table. Ordering after it means
+# our load is the later one and survives. (nftables.service is disabled by
+# default on Ubuntu; this is insurance against someone enabling it.)
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/wireguard/killswitch-peer.nft
+ExecStart=/usr/local/sbin/peer-egress-policy.sh
+ExecReload=/usr/sbin/nft -f /etc/wireguard/killswitch-peer.nft
+ExecReload=/usr/local/sbin/peer-egress-policy.sh
+# Deliberately NO ExecStop that removes the rules or the ip rule. Stopping this
+# unit — during a package upgrade, a dependency restart, or by hand — must not
+# be a way to silently disable the protection while the tunnel stays up.
+# Removing them is `nft delete table inet {{ peer_killswitch_table }}`, which is
+# explicit and leaves a shell history entry.
+
+[Install]
+WantedBy=multi-user.target

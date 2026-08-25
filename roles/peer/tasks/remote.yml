@@ -1,0 +1,165 @@
+---
+# Everything that touches the peer, over SSH. Runs after killswitch and route
+# (so the peer is reachable through the outer tunnel and drops otherwise) and
+# before tunnel.yml (which needs the peer's public key, read here).
+#
+# Two accounts on the peer: peer_ssh_user connects in (pre-exists, sudo unless
+# root), peer_user is created here (unprivileged, runs the tunnel).
+#
+# Nothing here touches sshd — that host has no console and sshd will not start if
+# it cannot bind, so a bad render would be unrecoverable.
+
+- name: Register the peer as a delegation target
+  ansible.builtin.add_host:
+    name: peer_remote
+    ansible_host: "{{ peer_endpoint_ip }}"
+    ansible_user: "{{ peer_ssh_user }}"
+    ansible_ssh_private_key_file: "{{ peer_remote_ssh_key }}"
+    ansible_ssh_common_args: "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+    ansible_connection: ssh
+    # root needs no sudo; requiring it would fail a peer without sudo installed.
+    ansible_become: "{{ peer_ssh_user != 'root' }}"
+  changed_when: false
+  check_mode: false
+
+# For a named account this proves key + passwordless sudo at once; for root, a
+# plain connectivity check.
+- name: Check the peer accepts an unattended connection
+  ansible.builtin.command: >-
+    ssh -o BatchMode=yes -o ConnectTimeout=10 -o IdentitiesOnly=yes
+    -o StrictHostKeyChecking=accept-new -i {{ peer_remote_ssh_key }}
+    {{ peer_ssh_user }}@{{ peer_endpoint_ip }}
+    {{ 'true' if peer_ssh_user == 'root' else 'sudo -n true' }}
+  register: peer_remote_reachable
+  changed_when: false
+  failed_when: false
+
+- name: Assert the peer is reachable
+  ansible.builtin.assert:
+    that: peer_remote_reachable.rc == 0
+    fail_msg: >-
+      Could not reach {{ peer_ssh_user }}@{{ peer_endpoint_ip }}:
+      {{ peer_remote_reachable.stderr | default('') | truncate(200) }}
+      {{ peer_remote_ssh_key }} must be authorized for {{ peer_ssh_user }} and
+      loaded in an agent this run can reach (`ssh-add` it; sudo drops the agent).
+      {% if peer_ssh_user != 'root' %}And {{ peer_ssh_user }} needs PASSWORDLESS
+      sudo — the play escalates through it.{% endif %}
+    success_msg: "{{ peer_ssh_user }} reachable{{ '' if peer_ssh_user == 'root' else ' with passwordless sudo' }}."
+
+# --- The unprivileged account the tunnel uses -------------------------------------
+- name: Create the unprivileged peer account
+  ansible.builtin.user:
+    name: "{{ peer_user }}"
+    # /bin/bash explicitly — useradd's default is /bin/sh (dash): no completion,
+    # no history, ~/.bashrc unread.
+    shell: /bin/bash
+    system: false
+    create_home: true
+    password: "!"          # key-only; nothing logs in interactively
+  delegate_to: peer_remote
+
+- name: Create the peer account's SSH directory
+  ansible.builtin.file:
+    path: "/home/{{ peer_user }}/.ssh"
+    state: directory
+    owner: "{{ peer_user }}"
+    group: "{{ peer_user }}"
+    mode: "0700"
+  delegate_to: peer_remote
+
+# Marker block, not an append, so rotating the key replaces the line rather than
+# stacking. restrict = no pty/agent/X11/forwarding/rc; port-forwarding adds back
+# only what the proxy needs — the options are why an unencrypted key is safe here.
+- name: Authorize the forward-only key on the peer account
+  ansible.builtin.blockinfile:
+    path: "/home/{{ peer_user }}/.ssh/authorized_keys"
+    marker: "# {mark} tunnel key"
+    create: yes
+    owner: "{{ peer_user }}"
+    group: "{{ peer_user }}"
+    mode: "0600"
+    block: |
+      restrict,port-forwarding {{ peer_tunnel_pub.content | b64decode | trim }}
+  delegate_to: peer_remote
+  when:
+    - peer_tunnel_key_enabled | bool
+    - peer_tunnel_pub.content is defined
+
+# The shell key too, unrestricted — the forward-only key can only forward, so
+# xpra and interactive ssh need this. Same key that reaches root, so it grants
+# nothing new; it just lets apps run as unprivileged peer_user rather than root.
+- name: Authorize the shell key on the peer account
+  ansible.builtin.blockinfile:
+    path: "/home/{{ peer_user }}/.ssh/authorized_keys"
+    marker: "# {mark} shell key"
+    create: yes
+    owner: "{{ peer_user }}"
+    group: "{{ peer_user }}"
+    mode: "0600"
+    block: |
+      {{ peer_ssh_pub.content | b64decode | trim }}
+  delegate_to: peer_remote
+  when: peer_ssh_pub.content is defined
+
+# --- The tunnel ------------------------------------------------------------------
+- name: Install wireguard-tools on the peer
+  ansible.builtin.apt:
+    name: wireguard-tools
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+  delegate_to: peer_remote
+
+- name: Secure the peer's WireGuard directory
+  ansible.builtin.file:
+    path: /etc/wireguard
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  delegate_to: peer_remote
+
+# Generated ON the peer and never leaves it. creates: keeps an existing key, so a
+# re-run does not change the peer's identity.
+- name: Generate the peer's private key
+  ansible.builtin.shell: "umask 077 && wg genkey > {{ peer_remote_key_path }}"
+  args:
+    creates: "{{ peer_remote_key_path }}"
+  delegate_to: peer_remote
+
+- name: Read the peer's public key
+  ansible.builtin.shell: "wg pubkey < {{ peer_remote_key_path }}"
+  register: peer_remote_pubkey
+  changed_when: false
+  delegate_to: peer_remote
+
+- name: Assert the peer's public key looks like one
+  ansible.builtin.assert:
+    that:
+      - peer_remote_pubkey.stdout | trim | length == 44
+      - (peer_remote_pubkey.stdout | trim) != (peer_derived_pubkey.stdout | default('') | trim)
+    fail_msg: >-
+      {{ peer_remote_key_path }} did not yield a usable public key
+      ({{ peer_remote_pubkey.stdout | default('') | trim | truncate(60) }}). If it
+      equals this host's key, the same key is on both ends and there is no peer.
+    success_msg: "Peer public key read."
+    quiet: true
+
+- name: Deploy the peer's tunnel config
+  ansible.builtin.template:
+    src: wg-peer-remote.conf.j2
+    dest: "/etc/wireguard/{{ peer_remote_interface }}.conf"
+    owner: root
+    group: root
+    mode: "0600"
+  diff: false
+  delegate_to: peer_remote
+  notify: Restart the peer's tunnel
+
+- name: Enable and start the peer's tunnel
+  ansible.builtin.systemd:
+    name: "wg-quick@{{ peer_remote_interface }}.service"
+    state: started
+    enabled: yes
+    daemon_reload: yes
+  delegate_to: peer_remote

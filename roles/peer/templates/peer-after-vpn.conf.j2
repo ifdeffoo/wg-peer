@@ -1,0 +1,15 @@
+# {{ ansible_managed | default('Ansible managed') }}
+#
+# Bring the inner tunnel up after the outer one. This is hygiene, not the
+# safety property — the kill switch is what makes the ordering unable to matter.
+# Without it the peer tunnel starts, finds no route to its endpoint, and logs
+# handshake failures until the outer tunnel appears; harmless, but it puts a
+# scary-looking failure in the journal of a host whose journal you want to be
+# able to trust at a glance.
+#
+# Wants= rather than Requires= on purpose: a Requires= would tear this tunnel
+# down whenever the outer one restarted, and wg-quick units are oneshot, so
+# nothing would bring it back until the next boot or playbook run.
+[Unit]
+After={{ peer_via_unit }}
+Wants={{ peer_via_unit }}

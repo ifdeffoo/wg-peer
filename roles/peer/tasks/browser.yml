@@ -1,0 +1,135 @@
+---
+# One browser profile pointed at the SOCKS proxy. A profile, not a setting: an
+# app-wide policies.json hits every profile, and profiles keep state apart.
+# user.js is re-read each startup, so a UI change reverts on next launch.
+
+- name: Confirm the browser is installed
+  ansible.builtin.stat:
+    path: "{{ peer_browser_command }}"
+  register: peer_browser_binary
+
+- name: Assert the browser is installed
+  ansible.builtin.assert:
+    that: peer_browser_binary.stat.exists
+    fail_msg: >-
+      {{ peer_browser_command }} is not installed — a prerequisite. Configure the
+      host first, or set peer_browser_enabled false on a gateway with no desktop.
+    success_msg: "Browser present."
+
+- name: Install what headless profile creation needs
+  ansible.builtin.apt:
+    name: "{{ peer_browser_packages }}"
+    state: present
+    update_cache: yes
+    cache_valid_time: 3600
+
+# Every level explicit: state=directory makes missing parents root-owned, which
+# breaks the browser in a way that reads as a corrupt profile.
+- name: Create the browser profile root
+  ansible.builtin.file:
+    path: "/home/{{ local_user }}/{{ peer_browser_profile_root.split('/')[:item | int] | join('/') }}"
+    state: directory
+    owner: "{{ local_user }}"
+    group: "{{ local_group }}"
+    mode: "0700"
+  loop: "{{ range(1, (peer_browser_profile_root.split('/') | length) + 1) | list }}"
+  loop_control:
+    label: "{{ peer_browser_profile_root.split('/')[:item | int] | join('/') }}"
+
+- name: Read the browser profile registry
+  ansible.builtin.slurp:
+    src: "/home/{{ local_user }}/{{ peer_browser_profile_root }}/profiles.ini"
+  register: peer_browser_ini
+  failed_when: false
+  check_mode: false
+
+# -CreateProfile needs a display even though it does nothing graphical — hence
+# xvfb-run. --verbose is required, not cosmetic: the launcher closes stdout/stderr
+# without it, so every failure is a silent rc=1.
+- name: Create the browser profile
+  ansible.builtin.command:
+    argv:
+      - xvfb-run
+      - -a
+      - "{{ peer_browser_command }}"
+      - --verbose
+      - -CreateProfile
+      - "{{ peer_browser_profile.name }} /home/{{ local_user }}/{{ peer_browser_profile_root }}/{{ peer_browser_profile.name }}"
+  become: true
+  become_user: "{{ local_user }}"
+  when: "'Name=' ~ peer_browser_profile.name not in (peer_browser_ini.content | default('') | b64decode)"
+  register: peer_browser_create
+  failed_when: false
+  timeout: 90
+  changed_when: peer_browser_create.rc == 0
+
+- name: Report a refusal to create it
+  ansible.builtin.debug:
+    msg: >-
+      -CreateProfile exited {{ peer_browser_create.rc }}:
+      {{ (peer_browser_create.stderr | default('') ~ ' ' ~ peer_browser_create.stdout | default('')) | trim | truncate(400) }}
+  when:
+    - peer_browser_create.rc is defined
+    - peer_browser_create.rc != 0
+
+- name: Re-read the browser profile registry
+  ansible.builtin.slurp:
+    src: "/home/{{ local_user }}/{{ peer_browser_profile_root }}/profiles.ini"
+  register: peer_browser_ini_after
+  failed_when: false
+  check_mode: false
+
+# The directory is not the profile name — a hand-made profile gets a random
+# prefix. Read the real Path from profiles.ini; guessing writes user.js where the
+# browser never reads it.
+- name: Find the directory the profile really uses
+  ansible.builtin.set_fact:
+    peer_browser_dirs: >-
+      {{ dict(_sections | map('regex_search', 'Name=[^\r\n]+') | map('replace', 'Name=', '') | map('trim')
+              | zip(_sections | map('regex_search', 'Path=[^\r\n]+') | map('replace', 'Path=', '') | map('trim'))) }}
+  vars:
+    _sections: >-
+      {{ (peer_browser_ini_after.content | default('') | b64decode).split('[')
+         | select('search', 'Name=') | select('search', 'Path=') | list }}
+
+# An unregistered profile's user.js is silently ignored — the browser starts on
+# another profile, unproxied, looking fine.
+- name: Assert the profile is registered
+  ansible.builtin.assert:
+    that:
+      - "'Name=' ~ peer_browser_profile.name in (peer_browser_ini_after.content | default('') | b64decode)"
+    fail_msg: >-
+      Profile "{{ peer_browser_profile.name }}" is not in profiles.ini — see the
+      task above for why. Or create it by hand: `{{ peer_browser_command }} -P`,
+      exact name, then re-run (the real path is read from profiles.ini).
+    success_msg: 'Profile "{{ peer_browser_profile.name }}" registered.'
+  when: not ansible_check_mode
+
+- name: Configure the profile
+  ansible.builtin.template:
+    src: browser-user.js.j2
+    # IsRelative=0 profiles carry an absolute Path; relative ones hang off the root.
+    dest: >-
+      {{ _dir if _dir.startswith('/')
+         else '/home/' ~ local_user ~ '/' ~ peer_browser_profile_root ~ '/' ~ _dir }}/user.js
+    owner: "{{ local_user }}"
+    group: "{{ local_group }}"
+    mode: "0600"
+  vars:
+    _dir: "{{ peer_browser_dirs[peer_browser_profile.name] }}"
+
+- name: Ensure the launcher directory exists
+  ansible.builtin.file:
+    path: "{{ peer_browser_launcher_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the launcher
+  ansible.builtin.template:
+    src: browser-launcher.desktop.j2
+    dest: "{{ peer_browser_launcher_dir }}/browser-{{ peer_browser_profile.name }}.desktop"
+    owner: root
+    group: root
+    mode: "0644"

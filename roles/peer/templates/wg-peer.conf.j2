@@ -1,0 +1,46 @@
+# {{ ansible_managed | default('Ansible managed') }}
+#
+# This host -> the peer host at the other provider.
+#
+# The Endpoint below is a public address, and the route to it goes through
+# {{ peer_via_interface }} (installed by that unit's drop-in). So these packets are WireGuard
+# inside WireGuard: the peer's provider sees a connection from a commercial VPN
+# exit address, not from this rack.
+#
+# MTU
+# ---
+# {{ peer_mtu }}, not the usual 1420, because this tunnel's packets pay WireGuard's
+# 60-byte overhead a second time inside the outer one. Getting it wrong does not
+# look like an MTU problem — the handshake is small and succeeds, SSH connects
+# and prints a banner, and then anything that fills a packet hangs forever.
+#
+# ADDRESSING IS MANAGEMENT-ONLY
+# -----------------------------
+# AllowedIPs is the tunnel subnet and nothing more. It does NOT include
+# 0.0.0.0/0 (this host does not route its traffic out through the peer) and it
+# does NOT advertise this LAN to the peer (the peer cannot reach anything here).
+# Widening it is the change that turns "I administer that host" into "those two
+# networks are joined", so it should be a deliberate, separate decision.
+#
+# NO Endpoint ON THE FAR SIDE
+# ---------------------------
+# The peer must NOT pin an Endpoint for this host: our source address is a
+# commercial VPN exit that changes. This side is the initiator and carries the
+# keepalive; the peer learns where we are from the handshake.
+#
+# NO `Table = off` HERE, AND NONE NEEDED
+# -------------------------------------
+# AllowedIPs is a narrow subnet rather than 0.0.0.0/0, so wg-quick installs one
+# ordinary route for it and seizes no routing policy. The outer tunnel is the
+# one that needed `Table = off`.
+
+[Interface]
+PrivateKey = {{ peer_private_key }}
+Address = {{ peer_local_address }}
+MTU = {{ peer_mtu }}
+
+[Peer]
+PublicKey = {{ peer_remote_pubkey.stdout | trim }}
+Endpoint = {{ peer_endpoint_ip }}:{{ peer_endpoint_port }}
+AllowedIPs = {{ peer_subnet }}
+PersistentKeepalive = {{ peer_keepalive }}

@@ -1,0 +1,307 @@
+---
+# A WireGuard tunnel to a remote host, carried inside an existing VPN tunnel on
+# this machine, plus the SSH configuration, SOCKS proxy and nftables rules that
+# go with it.
+#
+# ── What this role expects to find already ─────────────────────────────────────
+# It configures the tunnel and nothing underneath it. The host must already have:
+#
+#   * a WireGuard interface to a VPN provider, up and carrying traffic, with
+#     `Table = off` so it installs no routes or rules of its own — that is what
+#     leaves room for a second tunnel to route through it without the two
+#     contending over routing policy;
+#   * an unprivileged account whose internet egress is policy-routed through that
+#     interface, with a blackhole route behind it so it fails closed;
+#   * a Firefox-derived browser, if the browsing half is wanted.
+#
+# The role asserts these rather than discovering them. Without the outer tunnel
+# there is nothing to route the peer's traffic through, and its handshakes would
+# go out the ordinary default route instead — which works, and is not what was
+# asked for.
+
+# --- The tunnel ------------------------------------------------------------------
+# Interface name, and therefore also the config filename under /etc/wireguard,
+# which is how wg-quick derives it. Under 15 characters (IFNAMSIZ).
+peer_interface: wg-remote
+
+# This host's own key, from group_vars/all/local.yml. The peer's is generated on
+# the peer and only its public half is read back, so neither exists in two
+# places.
+peer_private_key: ""
+peer_endpoint_ip: ""       # the remote host's PUBLIC IPv4 — a literal, asserted
+peer_endpoint_port: 51820
+
+# Private addressing for the management tunnel.
+peer_subnet: 10.90.0.0/24
+peer_local_address: 10.90.0.1/24
+peer_remote_address: 10.90.0.2
+
+# MTU, and the single most likely thing to go subtly wrong here.
+#
+# This tunnel is nested inside the VPN tunnel, so its packets pay WireGuard's
+# overhead TWICE. The outer path is 1420; WireGuard's own overhead over IPv4 is
+# 60 bytes (20 IP + 8 UDP + 32 WireGuard), leaving 1360. The default below takes
+# 20 bytes of headroom on top of that, because paths that quietly add
+# encapsulation are exactly the paths you cannot see from here.
+#
+# Get this wrong and it does NOT look like an MTU problem: the handshake is small
+# and succeeds, SSH connects and shows a banner, and then the session hangs the
+# moment anything sends a full-size packet — `scp`, a long `journalctl`, apt.
+peer_mtu: 1340
+
+# The tunnel re-establishes on its own rather than on your next keystroke, which
+# is also what makes the staleness metric meaningful.
+peer_keepalive: 25
+
+# --- The tunnel this one rides ----------------------------------------------------
+# The WireGuard interface on this host that already reaches the internet. This
+# tunnel's packets travel inside it, so the peer sees that interface's exit
+# address rather than this machine's own.
+#
+# Three states:
+#
+#   ""        detect. Reads /etc/wireguard/*.conf — configuration, not liveness,
+#             because a tunnel that is merely DOWN would otherwise look like a
+#             host that has none, and the play would quietly go direct.
+#   <name>    use that interface.
+#   "none"    no outer tunnel; reach the peer over the default route.
+#
+# Detection resolves to "none" only when the host has no other WireGuard config
+# at all. More than one and it stops and asks, because which one carries this is
+# a choice rather than a deduction.
+peer_via_interface: ""
+
+# --- The local account this configures --------------------------------------------
+# The account on THIS host whose internet egress is already policy-routed through
+# the VPN interface. Its home holds the keys, it runs the SOCKS proxy, and the
+# browser profile belongs to it.
+#
+# Left empty it is derived from the owner of this checkout, and then checked
+# against the routing policy — see preflight.yml. Set it only where those two
+# disagree for a good reason.
+#
+# It must not be root, must not be the account running the play, and must not
+# have sudo.
+local_user: ""
+local_group: "{{ local_user }}"
+
+# --- A local name for the peer ----------------------------------------------------
+# An /etc/hosts alias for the peer's TUNNEL address, so `ssh <alias>` needs no DNS
+# at all. Empty disables it.
+#
+# Worth having as a matter of correctness rather than convenience: the tunnel is
+# addressed by literal IP everywhere else, and a name that resolves through the
+# site's resolver is a second source of truth that can disagree with the first.
+peer_alias: peer
+
+# --- Kill switch -------------------------------------------------------------------
+# Its own nftables table, separate from whatever the host's existing kill switch
+# uses. The separation is sound rather than merely convenient: every base chain
+# registered at a hook is evaluated, and `accept` ends only the chain it appears
+# in. A drop here cannot be undone by an accept elsewhere, so the two rulesets can
+# be maintained independently.
+#
+# It sits at a slightly earlier priority so its counters read in the order you
+# would reason about them. Correctness does not depend on that: a drop anywhere
+# at the hook is final.
+peer_killswitch_enabled: true
+peer_killswitch_table: peer_killswitch
+peer_killswitch_priority: "filter - 10"
+
+# ip rule priority for the exception that keeps the peer subnet reachable for
+# confined accounts. MUST be below the band the host's own egress policy owns
+# (100/110): that policy tears down only its own priorities on each run, so
+# anything lower survives it.
+peer_rule_priority: 90
+
+# Accounts that are policy-routed into the VPN table and must still reach the peer
+# subnet directly. Anything unconfined already uses the main table and needs no
+# rule.
+peer_direct_users: "{{ [local_user] }}"
+
+# --- Reaching the peer over SSH -----------------------------------------------------
+# A dedicated key pair and a pinned client configuration, rather than whatever
+# keys happen to be in the agent.
+#
+# A separate key ALONE is not enough, which is the part that surprises people:
+# OpenSSH offers each identity in turn, and sshd logs the fingerprint of every key
+# OFFERED, not only the one that succeeds. So the dedicated key, the explicit
+# IdentityFile and IdentitiesOnly=yes only do their job together.
+peer_ssh_enabled: true
+peer_ssh_key: .ssh/id_ed25519
+peer_ssh_key_type: ed25519
+
+# Whether this role CREATES that key, or only configures ssh to use it.
+#
+# Generating it is convenient right up to the first rebuild, and then it is a
+# lockout: the home directory is wiped, the role mints a fresh key, and
+# authorizing that key on the peer requires reaching the peer — which requires
+# the key you just lost. If the provider offers no console, there is no way back.
+#
+# So where the key must outlive the host, set this false and keep it in a password
+# manager: encrypted with a passphrase this repo never sees, and restored before
+# it is needed. The role then writes the client config and asserts the key is
+# present, rather than quietly minting one the peer has never heard of.
+peer_ssh_generate_key: false
+
+# --- The peer's two accounts ------------------------------------------------------
+# peer_ssh_user is the account this connects to the peer AS. It pre-exists and the
+# key above is authorized on it. Defaults to root, which needs no sudo (become is
+# skipped). Point it at a named account instead and that account must have
+# PASSWORDLESS sudo, since the play then escalates through it to configure the
+# tunnel and create the account below. Either way it is also the account a human
+# administers the peer through.
+peer_ssh_user: root
+
+# peer_user is created by the play, unprivileged. The forward-only key is
+# authorized on it and the SOCKS proxy logs in as it, so the account the tunnel
+# actually uses cannot escalate. It does not pre-exist and has no password —
+# nothing logs into it interactively.
+peer_user: dev
+
+# --- A second key, for services# --- A second key, for services rather than for people ---------------------------------
+# The key above may be one a HUMAN holds, passphrase-protected. That is right for
+# the key that grants a shell, and it is unusable by anything unattended: a
+# systemd unit has no agent and no terminal, so an encrypted key fails with
+# "Permission denied (publickey)" while the same `ssh peer` works perfectly by
+# hand. The symptom surfaces wherever the service's output is consumed, nowhere
+# near the cause.
+#
+# The fix is not to strip the passphrase. That would leave the SHELL-granting key
+# unencrypted on disk, so any offline copy of this machine — a snapshot, a backup
+# — carries a shell on the peer with it.
+#
+# Instead: a second, passphrase-less key whose only job is opening forwards, and
+# which is authorized on the peer with `restrict,port-forwarding` so that is the
+# only thing it CAN do. It is unencrypted at rest, and that is the trade taken
+# knowingly — if it leaks, the holder gets a proxy, not a shell. The two keys fail
+# independently, which is the entire point of there being two.
+peer_tunnel_key_enabled: true
+peer_tunnel_key: .ssh/peer_tunnel_ed25519
+
+# Its own Host entry, so `ssh peer` stays the interactive path with the
+# interactive key and nothing has to guess which of the two it should be using.
+peer_tunnel_alias: "{{ (peer_alias | default('peer', true)) ~ '-tunnel' }}"
+
+# --- Configuring the peer itself ------------------------------------------------------
+# The play reaches the peer over SSH as peer_ssh_user (see above), escalates with
+# its passwordless sudo, and does the rest: creates peer_user, installs
+# wireguard-tools, generates the peer's key if it has none, writes the far end of
+# the tunnel, and authorizes the forward-only key. Printing those for a human to
+# paste was the error-prone half — without the key options that line is a second
+# shell key.
+#
+# The connecting key is the one authorized for peer_ssh_user; if it is
+# passphrased, load it into an agent in the same shell that runs the play.
+peer_remote_ssh_key: "/home/{{ local_user }}/{{ peer_ssh_key }}"
+peer_remote_interface: wg0
+
+# Generated on the peer, with a creates: guard so a re-run never changes its
+# identity. Only the public half is read back.
+peer_remote_key_path: /etc/wireguard/private.key
+
+# --- Browsing through the peer, without running the browser there --------------------
+# An SSH SOCKS proxy over the tunnel: the browser runs HERE and its connections
+# are made from the PEER.
+#
+# WHY NOT RUN THE BROWSER THERE. A small VPS — 1.4 GB, and a container, so
+# `swapon` returns EPERM at any size — cannot fit Xorg plus xpra's encoder plus a
+# Firefox-derived browser. The failure mode is the OOM killer: the browser
+# vanishes mid-session with nothing useful logged. xpra below stays for anything
+# small that must genuinely RUN there.
+#
+# The trade, stated so it is a choice rather than a default: the browser profile —
+# history, cookies, cache — lives on this host rather than on the peer.
+peer_socks_enabled: true
+# Loopback ONLY, stated explicitly rather than relying on ssh's default. Bound to
+# any other address this is an open proxy that anyone on the network can use.
+peer_socks_listen: "127.0.0.1:1080"
+peer_socks_user: "{{ local_user }}"
+# Where the play checks what address the connection comes out at. Reached THROUGH
+# the proxy, and the answer is compared against the peer's own address, so a proxy
+# that quietly failed open cannot pass.
+peer_socks_check_url: "https://am.i.mullvad.net/json"
+
+# --- The browser profile that goes through the peer ------------------------------------
+# Added to the existing browser as a PROFILE rather than as a setting, because an
+# app-wide policy applies to every profile at once and there is already an
+# unproxied one. Profiles also keep cookies, history, cache and site-local state
+# separate, which a shared profile with a toggled proxy setting would not.
+peer_browser_enabled: true
+peer_browser_profile_root: ".mullvad-browser/.mullvad/mullvadbrowser"
+peer_browser_command: /usr/bin/mullvad-browser
+peer_browser_icon: mullvad-browser
+# Profile creation runs under xvfb-run: the launcher demands a display even for
+# -CreateProfile, which does nothing graphical, and a rebuilt host's browsing
+# account has never opened a session.
+peer_browser_packages:
+  - xvfb
+  # xvfb-run needs xauth to write its cookie.
+  - xauth
+
+peer_browser_launcher_dir: /usr/local/share/applications
+
+peer_browser_profile:
+  name: ifdef.foo
+  proxy: socks
+  label: "Browser (ifdef.foo — via peer)"
+  comment: "Connections are made from the peer"
+  # Optional. Opened on startup; a what-is-my-IP page confirms egress each launch.
+  homepage: "https://ipchicken.com"
+
+# --- Apps on the peer, for running there via xpra -------------------------------------
+# apt packages installed ON THE PEER. xterm is the classic xpra smoke test; add
+# whatever you actually mean to run there.
+peer_remote_apps: []
+
+# --- xpra, from upstream rather than Ubuntu --------------------------------------------
+# Runs an X server ON THE PEER and ships rendered frames back, instead of
+# forwarding the X11 protocol. Two reasons it is the default rather than an
+# upgrade:
+#
+#   * X11 is synchronous and chatty — drawing a window costs hundreds of round
+#     trips, and over a tunnel inside a tunnel each one pays the RTT twice.
+#   * Trust direction. `ssh -X` exposes THIS host's X server to clients running
+#     on the peer, which is backwards: the peer is the less trusted machine.
+#     With xpra nothing on the peer ever speaks X to this host.
+#
+# Ubuntu noble packages xpra 3.1.5, which predates the Python stack it runs on
+# and fails three separate ways:
+#
+#   * PIL.Image.ANTIALIAS was removed in Pillow 10 — window icons crash the client
+#   * a NameError (_saved_env) in xpra's own appindicator fallback, so the tray
+#     failure reports as a traceback rather than a warning
+#   * the OpenGL probe leaves a session running with nothing rendered
+#
+# Each has a flag or a package that papers over it, and chasing them individually
+# treats symptoms of a version gap that keeps producing new ones. Upstream ships
+# current builds for noble; 6.x clears all three.
+#
+# CLIENT AND SERVER VERSIONS MUST MATCH. The peer is not in this inventory, so
+# upgrading here means upgrading there in the same sitting — a mismatch is its
+# own failure mode and a less obvious one than the bugs it replaces.
+peer_xpra: true
+peer_xpra_keyring_url: "https://xpra.org/xpra.asc"
+# Upstream publishes a per-release deb822 sources file. Fetched rather than
+# hand-written so a change to their repo layout does not silently strip the host
+# of updates. `xpra-lts.sources` tracks 5.1 if you want the conservative line.
+peer_xpra_sources_url: >-
+  https://raw.githubusercontent.com/Xpra-org/xpra/master/packaging/repos/{{ ansible_distribution_release }}/xpra.sources
+# Recommends pull in CUPS, for xpra's printer forwarding. Not wanted:
+#
+#   * it opens a data path from the remote session into the local print system,
+#     which is not a channel this needs — pixels back, keystrokes forward
+#   * cups-browsed listens on UDP 631 and was the subject of a serious RCE chain
+#     in 2024. On the peer that is an internet-facing daemon with no purpose
+#   * you are never going to print from it
+peer_xpra_install_recommends: false
+# And told to xpra directly, so it does not try to reinstate what apt skipped.
+peer_xpra_printing: false
+
+# --- Verification -----------------------------------------------------------------------
+# Set FALSE for the first deploy, between standing the peer up and installing
+# this host's key on it — there is a window where the handshake correctly fails
+# on a host that is otherwise configured right.
+peer_require_handshake: true
+peer_handshake_retries: 12
+peer_handshake_delay: 5

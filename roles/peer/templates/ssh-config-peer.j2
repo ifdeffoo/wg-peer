@@ -1,0 +1,74 @@
+{# Rendered into a marked block in ~/.ssh/config. This line is a Jinja comment
+   and is not emitted. #}
+# Reaching the peer. Every option here is deliberate — see
+# roles/peer/defaults/main.yml.
+# The everyday path: the UNPRIVILEGED account, with the shell key. This is what
+# xpra rides (`xpra start ssh:{{ peer_alias | default('peer', true) }}`) and what an interactive
+# `ssh {{ peer_alias | default('peer', true) }}` lands you in, so anything you run on the peer runs as
+# {{ peer_user }} rather than root. For sudo/admin use the -admin alias below.
+Host {{ peer_alias | default('peer', true) }}
+    HostName {{ peer_remote_address }}
+    User {{ peer_user }}
+    IdentityFile ~/{{ peer_ssh_key }}
+
+    # Accept the peer's host key on first contact. The peer is reached only over
+    # the tunnel — a /32 you configured to a key you configured — so there is no
+    # third party in a position to answer as it, and requiring a human to seed
+    # known_hosts by hand would make the automated path below fail in BatchMode.
+    StrictHostKeyChecking accept-new
+
+    # THE IMPORTANT ONE. Without it, ssh offers every identity in the agent and
+    # every default key in ~/.ssh in turn, and sshd logs the fingerprint of each
+    # key OFFERED — not just the one that authenticates. Pointing at a dedicated
+    # key achieves nothing on its own; this is what makes it the only one sent.
+    IdentitiesOnly yes
+
+    # ansible.cfg sets ForwardAgent=yes globally for that repo, which is right
+    # for hosts you own and wrong for this one. A forwarded agent lets root on
+    # the peer enumerate your keys and authenticate AS YOU to anything else
+    # they can reach.
+    ForwardAgent no
+
+    # Off by default because the trust runs the wrong way: X11 forwarding gives
+    # clients on the peer real reach into this host's X session, and the peer is
+    # the less trusted machine here. The X11 SECURITY extension that `ssh -X`
+    # relies on is weak and routinely worked around with `-Y`.
+    #
+    # This does not stop you: `ssh -X {{ peer_alias | default('peer', true) }}` still works when you ask
+    # for it explicitly. Prefer xpra, which runs its X server ON THE PEER and
+    # sends pixels, so nothing there ever speaks X to this machine.
+    ForwardX11 no
+{% if peer_tunnel_key_enabled | bool %}
+
+# The same peer, reached by a service rather than by a person, and into a
+# DIFFERENT account: peer_user, unprivileged, with the forward-only key. The key
+# has no passphrase so an unattended service can use it, and the peer authorizes
+# it `restrict,port-forwarding`, so it opens forwards and cannot get a shell —
+# on an account that could not do anything with one anyway.
+#
+# A SEPARATE Host entry rather than a second IdentityFile on the one above:
+# ssh would offer both keys in turn, which puts the admin key's fingerprint in
+# the peer's auth log on every automated connection and defeats IdentitiesOnly.
+Host {{ peer_tunnel_alias }}
+    HostName {{ peer_remote_address }}
+    User {{ peer_user }}
+    IdentityFile ~/{{ peer_tunnel_key }}
+    IdentitiesOnly yes
+    ForwardAgent no
+    ForwardX11 no
+    StrictHostKeyChecking accept-new
+
+    # Nothing here will ever answer a prompt. Fail instead of hanging.
+    BatchMode yes
+{% endif %}
+
+# The admin path: the sudo account. Same key, different login — for configuring
+# the peer by hand, not for running things on it.
+Host {{ peer_alias | default('peer', true) }}-admin
+    HostName {{ peer_remote_address }}
+    User {{ peer_ssh_user }}
+    IdentityFile ~/{{ peer_ssh_key }}
+    IdentitiesOnly yes
+    ForwardAgent no
+    ForwardX11 no
+    StrictHostKeyChecking accept-new

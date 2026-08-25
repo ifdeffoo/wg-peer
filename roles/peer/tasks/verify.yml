@@ -1,0 +1,145 @@
+---
+# The play is the health check: nothing scrapes this host, so a clean run is the
+# only positive statement that the chain works. A flushed ruleset or a lost route
+# leaves everything apparently working, so these checks are the tell.
+
+# Handlers first, or these verify against config not yet applied.
+- name: Apply pending changes before verifying
+  ansible.builtin.meta: flush_handlers
+
+- name: Read the loaded peer kill-switch ruleset
+  ansible.builtin.command: "nft list table inet {{ peer_killswitch_table }}"
+  register: peer_nft_loaded
+  changed_when: false
+  failed_when: false
+  when: peer_killswitch_enabled | bool
+
+# Two asserts: table absent and table-not-covering-the-peer are different failures
+# with different fixes.
+- name: Assert the peer kill switch is loaded
+  ansible.builtin.assert:
+    that:
+      - peer_nft_loaded.rc == 0
+    fail_msg: >-
+      Table inet {{ peer_killswitch_table }} is not loaded — an outer-tunnel
+      outage would leak the peer's handshakes. Check `systemctl status
+      peer-killswitch`.
+    success_msg: "Peer kill switch loaded."
+  when: peer_killswitch_enabled | bool
+
+- name: Assert the kill switch covers the peer's address
+  ansible.builtin.assert:
+    that:
+      - peer_endpoint_ip in peer_nft_loaded.stdout
+    fail_msg: >-
+      Table loaded but holds no rule for the peer's address — usually the address
+      changed in local.yml without re-rendering. Re-run this play.
+    success_msg: "Kill switch covers the peer's address."
+  when: peer_killswitch_enabled | bool
+
+# The kernel's own routing decision — cheaper and quieter than a what-is-my-IP call.
+- name: Ask the kernel how it would reach the peer
+  ansible.builtin.command: "ip route get {{ peer_endpoint_ip }}"
+  register: peer_route
+  changed_when: false
+  when: peer_via_vpn | bool
+
+- name: Assert the peer routes over the outer tunnel
+  ansible.builtin.assert:
+    that: "'dev ' ~ peer_via_interface in peer_route.stdout"
+    fail_msg: >-
+      Traffic to the peer would leave via "{{ peer_route.stdout | trim }}", not
+      {{ peer_via_interface }}. Check `systemctl status {{ peer_via_unit }}` and
+      its peer-route.conf drop-in.
+    success_msg: "Peer traffic routes over {{ peer_via_interface }}."
+  when: peer_via_vpn | bool
+
+# Gated: between standing the peer up and it trusting our key there is a window
+# where this correctly fails. -e peer_require_handshake=false to skip it.
+- name: Wait for the peer tunnel to handshake
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    wg show {{ peer_interface }} latest-handshakes | awk 'NR==1 {print $2}'
+  args:
+    executable: /bin/bash
+  register: peer_handshake
+  changed_when: false
+  retries: "{{ peer_handshake_retries }}"
+  delay: "{{ peer_handshake_delay }}"
+  until: peer_handshake.stdout | int > 0
+  when: peer_require_handshake | bool
+
+# Without this exception the confined account's packets to the peer subnet hit the
+# VPN default route and go nowhere.
+- name: Check the peer-subnet routing exception is installed
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    ip rule list | grep -c 'to {{ peer_subnet }}.*lookup main'
+  args:
+    executable: /bin/bash
+  register: peer_rules
+  changed_when: false
+  failed_when: false
+  when: peer_direct_uids | default([]) | length > 0
+
+- name: Assert confined accounts can still reach the peer subnet
+  ansible.builtin.assert:
+    that:
+      - peer_rules.stdout | int >= peer_direct_uids | length
+    fail_msg: >-
+      Missing the priority-{{ peer_rule_priority }} peer-subnet rule for one of
+      {{ peer_direct_uids | map(attribute='name') | join(', ') }} — their packets
+      to {{ peer_subnet }} go nowhere. Check `ip rule list`.
+    success_msg: >-
+      Peer subnet reachable for
+      {{ peer_direct_uids | map(attribute='name') | join(', ') }}.
+  when: peer_direct_uids | default([]) | length > 0
+
+# The one check that confirms EGRESS, not just plumbing. Asserting on the peer's
+# own address means a proxy quietly falling back to direct cannot pass.
+- name: Check what the internet sees through the proxy
+  ansible.builtin.command: >-
+    curl -sS --max-time 20
+    --socks5-hostname {{ peer_socks_listen }}
+    {{ peer_socks_check_url }}
+  become: true
+  become_user: "{{ peer_socks_user }}"
+  register: peer_socks_check
+  changed_when: false
+  failed_when: false
+  retries: 6
+  delay: 5
+  until: peer_endpoint_ip in (peer_socks_check.stdout | default(''))
+  when:
+    - peer_socks_enabled | bool
+    - not ansible_check_mode
+
+- name: Assert the proxy egresses from the peer
+  ansible.builtin.assert:
+    that:
+      - peer_endpoint_ip in (peer_socks_check.stdout | default(''))
+    fail_msg: >-
+      Proxy traffic did not come out at the peer. Returned:
+      {{ peer_socks_check.stdout | default('') | truncate(120) or '(nothing)' }}.
+      Check `journalctl -u socks-peer -n 30`.
+    success_msg: >-
+      SOCKS proxy egresses from the peer.
+  when:
+    - peer_socks_enabled | bool
+    - not ansible_check_mode
+
+# The far side needs this host's public key. Printed because a peer that never
+# handshakes is usually this being wrong there.
+- name: Read this host's tunnel public key
+  ansible.builtin.command: "wg show {{ peer_interface }} public-key"
+  register: peer_local_pub
+  changed_when: false
+  failed_when: false
+
+- name: Show the key the peer must list
+  ansible.builtin.debug:
+    msg: >-
+      This host's public key is
+      {{ peer_local_pub.stdout | default('(unavailable)') | trim }}; the peer's
+      was read back from {{ peer_remote_key_path }}.
+  when: peer_local_pub.stdout | default('') | length > 0
